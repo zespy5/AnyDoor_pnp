@@ -1,3 +1,4 @@
+from __future__ import annotations
 from inspect import isfunction
 import math
 import torch
@@ -5,10 +6,9 @@ import torch.nn.functional as F
 from torch import nn, einsum
 from einops import rearrange, repeat
 from typing import Optional, Any
-
 from ldm.modules.diffusionmodules.util import checkpoint
-
-
+from torch.nn import functional as nnf
+T = torch.Tensor
 try:
     import xformers
     import xformers.ops
@@ -43,6 +43,36 @@ def init_(tensor):
     std = 1 / math.sqrt(dim)
     tensor.uniform_(-std, std)
     return tensor
+
+def expand_first(feat: T, scale=1.,) -> T:
+    b = feat.shape[0]
+    feat_style = torch.stack((feat[0], feat[b // 2])).unsqueeze(1)
+    if scale == 1:
+        feat_style = feat_style.expand(2, b // 2, *feat.shape[1:])
+    else:
+        feat_style = feat_style.repeat(1, b // 2, 1, 1, 1)
+        feat_style = torch.cat([feat_style[:, :1], scale * feat_style[:, 1:]], dim=1)
+    return feat_style.reshape(*feat.shape)
+
+
+def concat_first(feat: T, dim=2, scale=1.) -> T:
+    feat_style = expand_first(feat, scale=scale)
+    return torch.cat((feat, feat_style), dim=dim)
+
+
+def calc_mean_std(feat, eps: float = 1e-5) -> tuple[T, T]:
+    feat_std = (feat.var(dim=-2, keepdims=True) + eps).sqrt()
+    feat_mean = feat.mean(dim=-2, keepdims=True)
+    return feat_mean, feat_std
+
+
+def adain(feat: T) -> T:
+    feat_mean, feat_std = calc_mean_std(feat)
+    feat_style_mean = expand_first(feat_mean)
+    feat_style_std = expand_first(feat_std)
+    feat = (feat - feat_mean) / feat_std
+    feat = feat * feat_style_std + feat_style_mean
+    return feat
 
 
 # feedforward
@@ -198,8 +228,8 @@ class MemoryEfficientCrossAttention(nn.Module):
     # https://github.com/MatthieuTPHR/diffusers/blob/d80b531ff8060ec1ea982b65a1b8df70f73aa67c/src/diffusers/models/attention.py#L223
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
         super().__init__()
-        print(f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
-              f"{heads} heads.")
+        #print(f"Setting up {self.__class__.__name__}. Query dim is {query_dim}, context_dim is {context_dim} and using "
+        #      f"{heads} heads.")
         inner_dim = dim_head * heads
         context_dim = default(context_dim, query_dim)
 
@@ -214,32 +244,31 @@ class MemoryEfficientCrossAttention(nn.Module):
         self.attention_op: Optional[Any] = None
 
     def forward(self, x, context=None, mask=None):
+        batch_size, sequence_legnth, _ = x.shape
         q = self.to_q(x)
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
 
-        b, _, _ = q.shape
-        q, k, v = map(
-            lambda t: t.unsqueeze(3)
-            .reshape(b, t.shape[1], self.heads, self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b * self.heads, t.shape[1], self.dim_head)
-            .contiguous(),
-            (q, k, v),
-        )
+        q = q.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
+        k = k.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
+        v = v.view(batch_size, -1, self.heads, self.dim_head).transpose(1, 2)
 
-        # actually compute the attention, what we cannot get enough of
-        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+        q = adain(q)
+        k = adain(k)
+        v = adain(v)
+        
+        k = concat_first(k, -2)
+        v = concat_first(v, -2)
+
+        out = nnf.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        
+        out = out.transpose(1,2).reshape(batch_size,-1, self.heads*self.dim_head)
+        out = out.to(q.dtype)
 
         if exists(mask):
             raise NotImplementedError
-        out = (
-            out.unsqueeze(0)
-            .reshape(b, self.heads, out.shape[1], self.dim_head)
-            .permute(0, 2, 1, 3)
-            .reshape(b, out.shape[1], self.heads * self.dim_head)
-        )
+
         return self.to_out(out)
 
 

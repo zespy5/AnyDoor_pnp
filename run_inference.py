@@ -83,7 +83,7 @@ def process_pairs(ref_image, ref_mask, tar_image, tar_mask):
     tar_box_yyxx = expand_bbox(tar_mask, tar_box_yyxx, ratio=[1.1,1.2])
 
     # crop
-    tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=[1.5, 3])    #1.2 1.6
+    tar_box_yyxx_crop =  expand_bbox(tar_image, tar_box_yyxx, ratio=[2.0, 2.1])    #1.2 1.6
     tar_box_yyxx_crop = box2squre(tar_image, tar_box_yyxx_crop) # crop box
     y1,y2,x1,x2 = tar_box_yyxx_crop
 
@@ -148,7 +148,12 @@ def crop_back( pred, tar_image,  extra_sizes, tar_box_yyxx_crop):
 
 
 def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, guidance_scale = 5.0):
-    item = process_pairs(ref_image, ref_mask, tar_image, tar_mask)
+    num_samples = len(ref_image)
+    
+    control_list = []
+    clip_input_list = []
+    
+    '''item = process_pairs(ref_image, ref_mask, tar_image, tar_mask)
     ref = item['ref'] * 255
     tar = item['jpg'] * 127.5 + 127.5
     hint = item['hint'] * 127.5 + 127.5
@@ -160,20 +165,24 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, guidance_sc
 
     seed = random.randint(0, 65535)
     if save_memory:
-        model.low_vram_shift(is_diffusing=False)
+        model.low_vram_shift(is_diffusing=False)'''
+        
+    for i in range(num_samples):
+        item = process_pairs(ref_image[i], ref_mask[i], tar_image, tar_mask)
 
-    ref = item['ref']
-    tar = item['jpg'] 
-    hint = item['hint']
-    num_samples = 1
+        ref = item['ref']
+        hint = item['hint']
+        ctrl = torch.from_numpy(hint.copy()).float().cuda()
+        control_list.append(ctrl)
+        
+        clipin = torch.from_numpy(ref.copy()).float().cuda()
+        clip_input_list.append(clipin)
 
-    control = torch.from_numpy(hint.copy()).float().cuda() 
-    control = torch.stack([control for _ in range(num_samples)], dim=0)
+
+    control = torch.stack(control_list, dim=0)
     control = einops.rearrange(control, 'b h w c -> b c h w').clone()
 
-
-    clip_input = torch.from_numpy(ref.copy()).float().cuda() 
-    clip_input = torch.stack([clip_input for _ in range(num_samples)], dim=0)
+    clip_input = torch.stack(clip_input_list, dim=0)
     clip_input = einops.rearrange(clip_input, 'b h w c -> b c h w').clone()
 
     guess_mode = False
@@ -187,7 +196,7 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, guidance_sc
         model.low_vram_shift(is_diffusing=True)
 
     # ====
-    num_samples = 1 #gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
+    #num_samples = 2 #gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
     image_resolution = 512  #gr.Slider(label="Image Resolution", minimum=256, maximum=768, value=512, step=64)
     strength = 1  #gr.Slider(label="Control Strength", minimum=0.0, maximum=2.0, value=1.0, step=0.01)
     guess_mode = False #gr.Checkbox(label='Guess Mode', value=False)
@@ -204,28 +213,34 @@ def inference_single_image(ref_image, ref_mask, tar_image, tar_mask, guidance_sc
                                                     unconditional_conditioning=un_cond)
     if save_memory:
         model.low_vram_shift(is_diffusing=False)
-
+        
+    
     x_samples = model.decode_first_stage(samples)
     x_samples = (einops.rearrange(x_samples, 'b c h w -> b h w c') * 127.5 + 127.5).cpu().numpy()#.clip(0, 255).astype(np.uint8)
+    
+    gen_images = []
+    for i in range(num_samples):
+        result = x_samples[i][:,:,::-1]
+        result = np.clip(result,0,255)
+        
+        pred = x_samples[i]
+        pred = np.clip(pred,0,255)[1:,:,:]
+        sizes = item['extra_sizes']
+        tar_box_yyxx_crop = item['tar_box_yyxx_crop'] 
+        gen_image = crop_back(pred, tar_image, sizes, tar_box_yyxx_crop) 
+        gen_images.append(gen_image)
 
-    result = x_samples[0][:,:,::-1]
-    result = np.clip(result,0,255)
-
-    pred = x_samples[0]
-    pred = np.clip(pred,0,255)[1:,:,:]
-    sizes = item['extra_sizes']
-    tar_box_yyxx_crop = item['tar_box_yyxx_crop'] 
-    gen_image = crop_back(pred, tar_image, sizes, tar_box_yyxx_crop) 
-    return gen_image
+    return gen_images
 
 
 if __name__ == '__main__': 
-    '''
+    
     # ==== Example for inferring a single image ===
     reference_image_path = './examples/TestDreamBooth/FG/01.png'
+    second_reference_image_path = './examples/TestDreamBooth/FG/03.png'
     bg_image_path = './examples/TestDreamBooth/BG/000000309203_GT.png'
     bg_mask_path = './examples/TestDreamBooth/BG/000000309203_mask.png'
-    save_path = './examples/TestDreamBooth/GEN/gen_res.png'
+    save_path = './examples/TestDreamBooth/GEN/gen_res1.png'
 
     # reference image + reference mask
     # You could use the demo of SAM to extract RGB-A image with masks
@@ -234,8 +249,14 @@ if __name__ == '__main__':
     mask = (image[:,:,-1] > 128).astype(np.uint8)
     image = image[:,:,:-1]
     image = cv2.cvtColor(image.copy(), cv2.COLOR_BGR2RGB)
-    ref_image = image 
-    ref_mask = mask
+    
+    second_image = cv2.imread(second_reference_image_path, cv2.IMREAD_UNCHANGED)
+    second_mask = (second_image[:,:,-1]>128).astype(np.uint8)
+    second_image = second_image[:,:,:-1]
+    second_image = cv2.cvtColor(second_image.copy(), cv2.COLOR_BGR2RGB)
+    
+    ref_image = [image, second_image] 
+    ref_mask = [mask, second_mask]
 
     # background image
     back_image = cv2.imread(bg_image_path).astype(np.uint8)
@@ -245,14 +266,14 @@ if __name__ == '__main__':
     tar_mask = cv2.imread(bg_mask_path)[:,:,0] > 128
     tar_mask = tar_mask.astype(np.uint8)
     
-    gen_image = inference_single_image(ref_image, ref_mask, back_image.copy(), tar_mask)
+    gen_images = inference_single_image(ref_image, ref_mask, back_image.copy(), tar_mask)
     h,w = back_image.shape[0], back_image.shape[0]
-    ref_image = cv2.resize(ref_image, (w,h))
-    vis_image = cv2.hconcat([ref_image, back_image, gen_image])
+    ref_image = cv2.resize(ref_image[0], (w,h))
+    vis_image = cv2.hconcat([ref_image, back_image, gen_images[0],gen_images[1]])
     
-    cv2.imwrite(save_path, vis_image [:,:,::-1])
+    cv2.imwrite(save_path, vis_image[:,:,::-1])
+    
     '''
-    #'''
     # ==== Example for inferring VITON-HD Test dataset ===
 
     from omegaconf import OmegaConf
@@ -288,7 +309,7 @@ if __name__ == '__main__':
 
         vis_image = cv2.hconcat([ref_image, gt_image, gen_image])
         cv2.imwrite(gen_path, vis_image[:,:,::-1])
-    #'''
+    '''
 
     
 

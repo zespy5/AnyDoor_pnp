@@ -5,6 +5,7 @@ lightning_logs/
 image_log/
 
 #*.pth
+models
 *.pt
 *.ckpt
 *.safetensors
